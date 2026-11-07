@@ -187,3 +187,31 @@ fn unknown_condition_formats_are_false() {
     let bytes = [0, 5, 0, 0, 5, 0, 99];
     assert_eq!(evaluate(&bytes, &[]), Some(true));
 }
+
+// A tree of AND conditions, each with 255 children that all hold, visits
+// 1 + 255 + 255 * 255 conditions, just under one evaluation's own limit.
+// Callers that evaluate many conditions for one task share an allowance, so
+// repeating the tree cannot multiply that limit.
+#[test]
+fn evaluate_within_shares_the_callers_allowance() {
+    const VISITS: usize = 1 + 255 + 255 * 255;
+    // ConditionAnd with 255 copies of a 24 bit offset to the next table.
+    let and = |next: u32| [vec![0, 3, 255], next.to_be_bytes()[1..].repeat(255)].concat();
+    let len = and(0).len() as u32;
+    let mut bytes = [and(len), and(len)].concat();
+    // Format1AxisRange of axis 0 over [-1, 1], which holds at the default.
+    bytes.extend([0, 1, 0, 0, 0xC0, 0x00, 0x40, 0x00]);
+    let condition = Condition::read(FontData::new(&bytes)).unwrap();
+    assert_eq!(condition.evaluate(&[], |_| Ok(0.0)), Ok(true));
+    let mut work_left = VISITS * 3 / 2;
+    assert_eq!(
+        condition.evaluate_within(&[], |_| Ok(0.0), &mut work_left),
+        Ok(true)
+    );
+    assert_eq!(work_left, VISITS / 2);
+    assert_eq!(
+        condition.evaluate_within(&[], |_| Ok(0.0), &mut work_left),
+        Err(Error::LimitExceeded)
+    );
+    assert_eq!(work_left, 0);
+}

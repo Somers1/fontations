@@ -34,6 +34,22 @@ pub const MAX_OUTLINE_POINTS: usize = u16::MAX as usize + 1;
 /// [`VARC`]: crate::tables::varc
 pub const MAX_COMPOSITE_EDGES: usize = 2048;
 
+/// Maximum total work for drawing one [`VARC`] composite.
+///
+/// The components, conditions and leaf glyphs of the composite all spend
+/// from this one allowance. A component costs one unit, as does each
+/// condition evaluated, and a leaf costs its [`glyf`] point count or the
+/// number of charstring operations it runs. Without it, the limits that
+/// apply to each leaf on its own would multiply with
+/// [`MAX_COMPOSITE_EDGES`].
+///
+/// Matches HarfBuzz's `HB_VARC_MAX_WORK` in [`hb-limits.hh`].
+///
+/// [`glyf`]: crate::tables::glyf
+/// [`VARC`]: crate::tables::varc
+/// [`hb-limits.hh`]: https://github.com/harfbuzz/harfbuzz/blob/main/src/hb-limits.hh
+pub const MAX_VARC_WORK: usize = 1 << 20;
+
 /// Maximum number of scripts visited in a layout table's script list.
 ///
 /// Matches HarfBuzz's `HB_MAX_SCRIPTS` in [`hb-limits.hh`].

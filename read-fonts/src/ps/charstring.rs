@@ -263,8 +263,27 @@ pub fn evaluate<'a>(
     charstring_data: &[u8],
     sink: &'a mut impl CommandSink,
 ) -> Result<Option<Fixed>, Error> {
+    let mut ops_left = u32::MAX;
+    evaluate_within(context, blend_state, charstring_data, sink, &mut ops_left)
+}
+
+/// As [`evaluate`], but the operations processed are also taken from
+/// `ops_left`, which the caller shares with other work.
+///
+/// Returns [`Error::LimitExceeded`] once `ops_left` is spent, as for
+/// [`MAX_OPERATIONS`].
+pub(crate) fn evaluate_within<'a>(
+    context: &'a impl CharstringContext,
+    blend_state: Option<BlendState<'a>>,
+    charstring_data: &[u8],
+    sink: &'a mut impl CommandSink,
+    ops_left: &mut u32,
+) -> Result<Option<Fixed>, Error> {
     let mut evaluator = Evaluator::new(context, blend_state, sink);
-    evaluator.evaluate(charstring_data)?;
+    evaluator.max_ops = MAX_OPERATIONS.min(*ops_left);
+    let result = evaluator.evaluate(charstring_data);
+    *ops_left -= evaluator.ops_done.min(evaluator.max_ops);
+    result?;
     let width = evaluator.have_read_width.then_some(evaluator.wx);
     sink.finish();
     Ok(width)
@@ -361,6 +380,8 @@ struct Evaluator<'a> {
     in_seac: bool,
     /// Number of operators or numbers processed so far
     ops_done: u32,
+    /// Number of operators or numbers that may be processed
+    max_ops: u32,
     /// The transient array that `put` and `get` address.
     storage: [Fixed; STORAGE_SIZE],
     /// The `BuildCharArray` of a multiple master font, sized on first use.
@@ -393,6 +414,7 @@ impl<'a> Evaluator<'a> {
             stack_ix: 0,
             in_seac: false,
             ops_done: 0,
+            max_ops: MAX_OPERATIONS,
             storage: [Fixed::ZERO; STORAGE_SIZE],
             build_char: smallvec::SmallVec::new(),
         }
@@ -423,7 +445,7 @@ impl<'a> Evaluator<'a> {
         let mut seen_endchar = false;
         while cursor.remaining_bytes() != 0 {
             self.ops_done += 1;
-            if self.ops_done > MAX_OPERATIONS {
+            if self.ops_done > self.max_ops {
                 return Err(Error::LimitExceeded);
             }
             let b0 = cursor.read::<u8>()?;
@@ -2492,6 +2514,67 @@ mod tests {
         assert_eq!(eval.x, Fixed::from_i32(100));
         assert_eq!(eval.y, Fixed::from_i32(200));
         assert_eq!(commands.0, expected);
+    }
+
+    /// Local subroutines in `levels` levels, where each calls the next
+    /// `calls` times and the last draws 24 lines.
+    ///
+    /// The work is `calls^levels` times the size of the last level, far
+    /// out of proportion to the size of the data.
+    struct Fanout(Vec<Vec<u8>>);
+
+    impl Fanout {
+        fn new(levels: u8, calls: usize) -> Self {
+            let mut subrs: Vec<Vec<u8>> = (1..=levels)
+                // Push the next level's index and call it.
+                .map(|next| [[139 + next, 10].repeat(calls), vec![11]].concat())
+                .collect();
+            // 48 arguments for rlineto, then return.
+            subrs.push([vec![140; 48], vec![5, 11]].concat());
+            Self(subrs)
+        }
+    }
+
+    impl CharstringContext for Fanout {
+        fn kind(&self) -> CharstringKind {
+            CharstringKind::Type2
+        }
+
+        fn seac_components(&self, _base_code: i32, _accent_code: i32) -> Result<[&[u8]; 2], Error> {
+            Err(Error::InvalidOperation)
+        }
+
+        fn global_subr(&self, _index: i32) -> Result<&[u8], Error> {
+            Err(Error::MissingResource)
+        }
+
+        fn subr(&self, index: i32) -> Result<&[u8], Error> {
+            self.0
+                .get(index as usize)
+                .map(Vec::as_slice)
+                .ok_or(Error::MissingResource)
+        }
+    }
+
+    #[test]
+    fn evaluate_within_spends_the_callers_allowance() {
+        // Call the first level, then end.
+        let charstring = [139, 10, 14];
+        let fanout = Fanout::new(4, 7);
+        let mut commands = CaptureCommandSink::default();
+        let mut ops_left = u32::MAX;
+        evaluate_within(&fanout, None, &charstring, &mut commands, &mut ops_left).unwrap();
+        let ops = u32::MAX - ops_left;
+        // 7^4 calls of the 50 operation leaf, and more for the calls.
+        assert!(ops > 7u32.pow(4) * 50, "{ops}");
+        // Two evaluations from an allowance for one and a half.
+        let mut ops_left = ops * 3 / 2;
+        evaluate_within(&fanout, None, &charstring, &mut commands, &mut ops_left).unwrap();
+        assert_eq!(ops_left, ops / 2);
+        let err =
+            evaluate_within(&fanout, None, &charstring, &mut commands, &mut ops_left).unwrap_err();
+        assert!(matches!(err, Error::LimitExceeded));
+        assert_eq!(ops_left, 0);
     }
 
     struct NullContext(CharstringKind);

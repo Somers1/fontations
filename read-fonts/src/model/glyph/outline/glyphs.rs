@@ -213,6 +213,11 @@ impl<'a> OutlineGlyphs<'a> {
     ///
     /// This is used for the components of a composite. The `coords` may
     /// differ from the font's location.
+    ///
+    /// The work the glyph takes is charged to `work_left`: its point count
+    /// for `glyf`, or the operations its charstring runs for CFF. Returns
+    /// [`Error::LimitExceeded`] once `work_left` is spent.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_base(
         &self,
         glyph: GlyphId,
@@ -221,6 +226,7 @@ impl<'a> OutlineGlyphs<'a> {
         precision: Precision,
         buf: &mut [u8],
         mut sink: &mut dyn PathSink,
+        work_left: &mut usize,
     ) -> Result<(), Error> {
         let font = self.font;
         let at_own_location = same_location(coords, font.normalized_coords());
@@ -229,10 +235,12 @@ impl<'a> OutlineGlyphs<'a> {
             Base::Glyf(context) => {
                 if at_own_location {
                     let plan = OutlinePlan::new(&context, glyph)?;
+                    charge(work_left, plan.num_points as usize)?;
                     draw_plan(&plan, &context, options, precision, buf, sink)?;
                 } else {
                     let at = FontAt { context, coords };
                     let plan = OutlinePlan::new(&at, glyph)?;
+                    charge(work_left, plan.num_points as usize)?;
                     draw_plan(&plan, &at, options, precision, buf, sink)?;
                 }
                 Ok(())
@@ -244,9 +252,22 @@ impl<'a> OutlineGlyphs<'a> {
                 } else {
                     cff.subfont(index, coords)?
                 };
-                cff.draw(&subfont, glyph, coords, options.ppem, &mut sink)?;
+                let mut ops_left = u32::try_from(*work_left).unwrap_or(u32::MAX);
+                let before = ops_left;
+                let result = cff.draw_within(
+                    &subfont,
+                    glyph,
+                    coords,
+                    options.ppem,
+                    &mut sink,
+                    &mut ops_left,
+                );
+                *work_left -= (before - ops_left) as usize;
+                result?;
                 Ok(())
             }
+            // A Type 1 font has no `VARC` table, so it is never the base of
+            // a composite.
             Base::Type1(type1) => {
                 type1.draw(glyph, options.ppem, &mut sink)?;
                 Ok(())
@@ -270,6 +291,13 @@ impl<'a> OutlineGlyphs<'a> {
             _ => 0,
         }
     }
+}
+
+/// Takes `cost` from `work_left`, or returns [`Error::LimitExceeded`] if
+/// less than that is left.
+pub(super) fn charge(work_left: &mut usize, cost: usize) -> Result<(), Error> {
+    *work_left = work_left.checked_sub(cost).ok_or(Error::LimitExceeded)?;
+    Ok(())
 }
 
 /// Returns true if two coordinate lists define the same location.

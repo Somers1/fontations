@@ -51,6 +51,24 @@ impl Condition<'_> {
     ) -> Result<bool, Error> {
         Evaluator::new(coords, delta).evaluate(self, MAX_RECURSION_DEPTH)
     }
+
+    /// As [`evaluate`](Self::evaluate), but each condition visited is also
+    /// taken from `work_left`, which the caller shares with other work.
+    ///
+    /// Returns [`Error::LimitExceeded`] once `work_left` is spent.
+    pub(crate) fn evaluate_within(
+        &self,
+        coords: &[F2Dot14],
+        delta: impl FnMut(u32) -> Result<f64, Error>,
+        work_left: &mut usize,
+    ) -> Result<bool, Error> {
+        let mut evaluator = Evaluator::new(coords, delta);
+        evaluator.remaining_ops = evaluator.remaining_ops.min(*work_left);
+        let before = evaluator.remaining_ops;
+        let result = evaluator.evaluate(self, MAX_RECURSION_DEPTH);
+        *work_left -= before - evaluator.remaining_ops;
+        result
+    }
 }
 
 impl ConditionSet<'_> {

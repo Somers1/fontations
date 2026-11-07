@@ -406,6 +406,20 @@ impl<'a> CffFontRef<'a> {
         coords: &[F2Dot14],
         sink: &mut impl CommandSink,
     ) -> Result<Option<Fixed>, Error> {
+        let mut ops_left = u32::MAX;
+        self.evaluate_charstring_within(subfont, gid, coords, sink, &mut ops_left)
+    }
+
+    /// As [`evaluate_charstring`](Self::evaluate_charstring), but the
+    /// operations processed are also taken from `ops_left`.
+    pub(crate) fn evaluate_charstring_within(
+        &self,
+        subfont: &Subfont,
+        gid: GlyphId,
+        coords: &[F2Dot14],
+        sink: &mut impl CommandSink,
+        ops_left: &mut u32,
+    ) -> Result<Option<Fixed>, Error> {
         let charstrings = self.top_dict.charstrings.clone();
         let blend = self.blend_state(subfont.vs_index, coords);
         let subrs = if subfont.subrs_offset != 0 {
@@ -421,7 +435,9 @@ impl<'a> CffFontRef<'a> {
             .get(gid.to_u32() as usize)
             .ok_or(Error::Malformed)?;
         let ctx = (self.data, &charstrings, &self.global_subrs, &subrs);
-        if let Some(width) = charstring::evaluate(&ctx, blend, charstring_data, sink)? {
+        if let Some(width) =
+            charstring::evaluate_within(&ctx, blend, charstring_data, sink, ops_left)?
+        {
             Ok(Some(width + subfont.nominal_width))
         } else {
             Ok(subfont.default_width)
@@ -526,10 +542,26 @@ impl<'a> CffFontRef<'a> {
         ppem: Option<f32>,
         sink: &mut impl PathSink,
     ) -> Result<Option<f32>, Error> {
+        let mut ops_left = u32::MAX;
+        self.draw_within(subfont, gid, coords, ppem, sink, &mut ops_left)
+    }
+
+    /// As [`draw`](Self::draw), but the operations processed are also taken
+    /// from `ops_left`.
+    pub(crate) fn draw_within(
+        &self,
+        subfont: &Subfont,
+        gid: GlyphId,
+        coords: &[F2Dot14],
+        ppem: Option<f32>,
+        sink: &mut impl PathSink,
+        ops_left: &mut u32,
+    ) -> Result<Option<f32>, Error> {
         let mut nop_filter = NopFilterSink::new(sink);
         let transform = self.transform(subfont, ppem);
         let mut transformer = TransformSink::new(&mut nop_filter, transform);
-        let width = self.evaluate_charstring(subfont, gid, coords, &mut transformer)?;
+        let width =
+            self.evaluate_charstring_within(subfont, gid, coords, &mut transformer, ops_left)?;
         Ok(width.map(|w| transform.transform_h_metric(w).to_f32().max(0.0)))
     }
 

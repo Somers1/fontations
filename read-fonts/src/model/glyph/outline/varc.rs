@@ -13,11 +13,13 @@
 //! beyond that buffer.
 
 use super::{
-    glyf::Precision, glyphs::OutlineGlyphs, DrawOptions, DrawnMetrics, PathSink, TransformSink,
+    glyf::Precision,
+    glyphs::{charge, OutlineGlyphs},
+    DrawOptions, DrawnMetrics, PathSink, TransformSink,
 };
 use crate::model::Error;
 use crate::{
-    limits::{MAX_COMPOSITE_EDGES, MAX_RECURSION_DEPTH},
+    limits::{MAX_COMPOSITE_EDGES, MAX_RECURSION_DEPTH, MAX_VARC_WORK},
     mem::take_slice,
     tables::{
         varc::{
@@ -54,6 +56,10 @@ pub(crate) trait VarcContext {
     /// The `coords` may differ from [`Self::coords`]. `ppem` is the size of
     /// the composite, or `None` for font units. `buf` is working memory of
     /// at least [`Self::glyph_buffer_size`] bytes for the glyph.
+    ///
+    /// The work of drawing the glyph is taken from `work_left`, which every
+    /// leaf of the composite shares, so that the leaves' own limits do not
+    /// multiply with the composite's.
     fn draw_glyph(
         &self,
         glyph: GlyphId,
@@ -61,6 +67,7 @@ pub(crate) trait VarcContext {
         ppem: Option<f32>,
         buf: &mut [u8],
         sink: &mut dyn PathSink,
+        work_left: &mut usize,
     ) -> Result<(), Error>;
 
     /// Returns the size in bytes of the working memory needed to draw
@@ -422,6 +429,9 @@ impl<'a> Outlines<'a> {
         let store_regions = draw.store_regions;
         for component in record.components() {
             let component = component?;
+            // Every component costs work, so that many which their
+            // conditions leave out cannot add up unchecked.
+            charge(&mut scratch.work_left, 1)?;
             if !self.component_condition_met(
                 &component,
                 current_coords,
@@ -519,6 +529,7 @@ impl<'a> Outlines<'a> {
                 draw.ppem,
                 leaf,
                 &mut TransformSink::new(&mut *sink, matrix),
+                &mut scratch.work_left,
             )?;
         }
         stack.pop();
@@ -709,6 +720,7 @@ impl Layout {
                 axis_values,
                 axis_indices,
                 edges_left: MAX_COMPOSITE_EDGES,
+                work_left: MAX_VARC_WORK,
             },
         })
     }
@@ -727,13 +739,16 @@ struct Memory<'m> {
     scratch: Scratch<'m>,
 }
 
-/// Slices that each level uses in turn, and the number of edges left to
-/// walk.
+/// Slices that each level uses in turn, the number of edges left to walk
+/// and the work left to spend.
 struct Scratch<'m> {
     deltas: &'m mut [f64],
     axis_values: &'m mut [f64],
     axis_indices: &'m mut [u16],
     edges_left: usize,
+    /// Shared by the components, conditions and leaves of one draw. See
+    /// [`MAX_VARC_WORK`].
+    work_left: usize,
 }
 
 /// The unused runs of coordinates and scalars.
@@ -985,12 +1000,17 @@ fn eval_condition(
     scalar_cache: &mut ScalarCache<'_>,
     scratch: &mut Scratch<'_>,
 ) -> Result<bool, Error> {
-    condition.evaluate(coords, |var_idx| {
-        let (var_store, regions) = store_regions.ok_or(Error::Malformed)?;
-        let delta = scratch.deltas.get_mut(..1).ok_or(Error::Malformed)?;
-        compute_tuple_deltas(var_store, regions, var_idx, coords, scalar_cache, delta)?;
-        Ok(delta[0])
-    })
+    let deltas = &mut *scratch.deltas;
+    condition.evaluate_within(
+        coords,
+        |var_idx| {
+            let (var_store, regions) = store_regions.ok_or(Error::Malformed)?;
+            let delta = deltas.get_mut(..1).ok_or(Error::Malformed)?;
+            compute_tuple_deltas(var_store, regions, var_idx, coords, scalar_cache, delta)?;
+            Ok(delta[0])
+        },
+        &mut scratch.work_left,
+    )
 }
 
 /// Returns the factor that scales font units to `ppem`.
@@ -1139,13 +1159,21 @@ impl VarcContext for Leaves<'_> {
         ppem: Option<f32>,
         buf: &mut [u8],
         sink: &mut dyn PathSink,
+        work_left: &mut usize,
     ) -> Result<(), Error> {
         let options = DrawOptions {
             ppem,
             ..self.options
         };
-        self.base
-            .draw_base(glyph, coords, &options, self.precision, buf, sink)
+        self.base.draw_base(
+            glyph,
+            coords,
+            &options,
+            self.precision,
+            buf,
+            sink,
+            work_left,
+        )
     }
 
     fn glyph_buffer_size(&self, glyph: GlyphId) -> usize {
@@ -1204,6 +1232,7 @@ mod tests {
             _ppem: Option<f32>,
             _buf: &mut [u8],
             _pen: &mut dyn PathSink,
+            _work_left: &mut usize,
         ) -> Result<(), Error> {
             Ok(())
         }
@@ -1739,6 +1768,7 @@ mod tests {
             axis_values: &mut [],
             axis_indices: &mut [],
             edges_left: MAX_COMPOSITE_EDGES,
+            work_left: MAX_VARC_WORK,
         };
 
         let result = eval_condition(
@@ -1767,6 +1797,7 @@ mod tests {
             axis_values: &mut [],
             axis_indices: &mut [],
             edges_left: MAX_COMPOSITE_EDGES,
+            work_left: MAX_VARC_WORK,
         };
 
         // ConditionFormat1: axis 0, filter range [-1.0, 1.0].
@@ -1969,6 +2000,7 @@ mod tests {
                 _ppem: Option<f32>,
                 _buf: &mut [u8],
                 _pen: &mut dyn PathSink,
+                _work_left: &mut usize,
             ) -> Result<(), Error> {
                 Ok(())
             }
@@ -2047,6 +2079,140 @@ mod tests {
         let result = outline.draw(&DrawOptions::default(), DrawMemory::Scratch, &mut path);
         assert_eq!(result.err(), Some(Error::LimitExceeded));
         assert!(path.is_empty());
+    }
+
+    /// Returns a font whose glyph 0 is a `VARC` composite of `count` copies
+    /// of glyph 1, a simple `glyf` glyph of 65,535 points.
+    ///
+    /// Repeated flags and coordinates that never move let the leaf's points
+    /// cost almost nothing in the file, so a few hundred bytes ask for
+    /// `count * 65,535` points of work.
+    fn point_flood(count: usize) -> crate::model::Font {
+        use crate::model::{Blob, Font};
+        use alloc::{sync::Arc, vec, vec::Vec};
+        use types::Tag;
+        const POINTS: usize = 65_535;
+        // On curve, with x and y the same as the previous point.
+        const SAME: u8 = 0x01 | 0x10 | 0x20;
+        const REPEAT: u8 = 0x08;
+        let mut leaf = Vec::new();
+        // One contour, a zero bounding box and the last point's index.
+        leaf.extend_from_slice(&1i16.to_be_bytes());
+        leaf.extend_from_slice(&[0; 8]);
+        leaf.extend_from_slice(&((POINTS - 1) as u16).to_be_bytes());
+        // No instructions.
+        leaf.extend_from_slice(&[0, 0]);
+        let mut left = POINTS;
+        while left > 0 {
+            let run = left.min(256);
+            leaf.extend_from_slice(&[SAME | REPEAT, (run - 1) as u8]);
+            left -= run;
+        }
+        leaf.resize(leaf.len().next_multiple_of(4), 0);
+        let mut varc = vec![0u8; 24];
+        varc[..4].copy_from_slice(&0x00010000u32.to_be_bytes());
+        varc[4..8].copy_from_slice(&24u32.to_be_bytes());
+        // Coverage of glyph 0 alone.
+        varc.extend_from_slice(&[0, 1, 0, 1, 0, 0]);
+        let offset = varc.len() as u32;
+        varc[20..24].copy_from_slice(&offset.to_be_bytes());
+        // One CFF2 INDEX entry with 32 bit offsets.
+        varc.extend_from_slice(&1u32.to_be_bytes());
+        varc.push(4);
+        varc.extend_from_slice(&1u32.to_be_bytes());
+        varc.extend_from_slice(&((count * 3 + 1) as u32).to_be_bytes());
+        for _ in 0..count {
+            // No flags, glyph 1.
+            varc.extend_from_slice(&[0, 0, 1]);
+        }
+        let base = FontRef::new(font_test_data::MATERIAL_SYMBOLS_SUBSET).unwrap();
+        let num_glyphs = base.maxp().unwrap().num_glyphs() as u32;
+        // Long offsets: glyph 0 is empty, glyph 1 is the leaf and the rest
+        // are empty.
+        let mut head = base
+            .table_data(Tag::new(b"head"))
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        head[50..52].copy_from_slice(&1i16.to_be_bytes());
+        let loca: Vec<u8> = (0..=num_glyphs)
+            .map(|glyph| if glyph < 2 { 0 } else { leaf.len() as u32 })
+            .flat_map(u32::to_be_bytes)
+            .collect();
+        let source: Arc<dyn Fn(Tag) -> Option<Blob> + Send + Sync> =
+            Arc::new(move |tag| match &tag.to_be_bytes() {
+                b"VARC" => Some(Blob::from(varc.clone())),
+                b"glyf" => Some(Blob::from(leaf.clone())),
+                b"loca" => Some(Blob::from(loca.clone())),
+                b"head" => Some(Blob::from(head.clone())),
+                b"gvar" => None,
+                _ => base
+                    .table_data(tag)
+                    .map(|data| Blob::from(data.as_bytes().to_vec())),
+            });
+        Font::new(source, 0).unwrap()
+    }
+
+    // The leaves of a composite spend from one allowance, so the work a
+    // composite asks for cannot be the product of its edge limit and the
+    // size of its largest leaf.
+    #[test]
+    fn leaves_share_one_work_budget() {
+        use crate::model::glyph::outline::{DrawMemory, DrawOptions, NullSink, OutlineSource};
+        let draw = |count: usize| {
+            let font = point_flood(count);
+            let outline = font.outline_glyphs().get(GlyphId::new(0)).unwrap();
+            assert_eq!(outline.source(), OutlineSource::Varc);
+            outline.draw(&DrawOptions::default(), DrawMemory::Scratch, &mut NullSink)
+        };
+        // A few large leaves fit.
+        let fits = MAX_VARC_WORK / 65_535 - 1;
+        assert!(draw(fits).is_ok());
+        // Without the shared allowance, these would draw about 131 million
+        // points.
+        assert_eq!(draw(2000).err(), Some(Error::LimitExceeded));
+    }
+
+    // Each condition shares the composite's allowance, rather than starting
+    // its own.
+    #[test]
+    fn conditions_spend_from_the_draw_budget() {
+        use crate::{FontData, FontRead};
+        // Format1AxisRange of axis 0 over [-1, 1], which holds at the default.
+        let leaf: [u8; 8] = [0x00, 0x01, 0x00, 0x00, 0xC0, 0x00, 0x40, 0x00];
+        let cond = Condition::read(FontData::new(&leaf)).unwrap();
+        let (_font, store, regions) = condition_eval_env();
+        let mut values = alloc::vec![0.0f32; regions.region_count() as usize];
+        let mut cache = ScalarCache::new(&mut values);
+        let mut deltas = [0.0f64; 1];
+        let mut scratch = Scratch {
+            deltas: &mut deltas,
+            axis_values: &mut [],
+            axis_indices: &mut [],
+            edges_left: MAX_COMPOSITE_EDGES,
+            work_left: 2,
+        };
+        for _ in 0..2 {
+            assert!(eval_condition(
+                &cond,
+                &[],
+                Some((&store, &regions)),
+                &mut cache,
+                &mut scratch
+            )
+            .unwrap());
+        }
+        assert_eq!(scratch.work_left, 0);
+        assert_eq!(
+            eval_condition(
+                &cond,
+                &[],
+                Some((&store, &regions)),
+                &mut cache,
+                &mut scratch
+            ),
+            Err(Error::LimitExceeded)
+        );
     }
 
     // A component that leads back to a glyph being drawn closes a cycle and
