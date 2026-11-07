@@ -29,7 +29,9 @@ pub const NESTING_DEPTH_LIMIT: u32 = 10;
 /// was chosen to match our instruction limit for the TrueType interpreter.
 ///
 /// FreeType only limits depth, not number of operations.
-const MAX_OPERATIONS: u32 = 1_000_000;
+///
+/// Evaluation past this many operations fails with `Error::LimitExceeded`.
+pub const MAX_OPERATIONS: u32 = 1_000_000;
 
 /// Size of the transient array that `put` and `get` address.
 ///
